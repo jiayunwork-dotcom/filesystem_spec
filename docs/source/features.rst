@@ -198,6 +198,124 @@ Pickling an independent memory filesystem copies its files and directories.
 The default global filesystem continues to use the global store in the process
 where it is unpickled.
 
+Concatenated reference files
+----------------------------
+
+The ``reference`` filesystem presents byte ranges of other files as a
+filesystem of "virtual" files. Spec version 1 maps each virtual file to inline
+bytes or to one range of one remote object. Spec **version 2** additionally
+allows a virtual file to be the *concatenation* of any number of pieces, so a
+single logical file can be assembled from fragments of several data-lake
+objects plus literal bytes, without copying anything:
+
+.. code-block:: json
+
+    {
+        "version": 2,
+        "templates": {"bucket": "s3://my-bucket"},
+        "refs": {
+            "dataset.csv": {
+                "segments": [
+                    "id,value\n",
+                    ["{{bucket}}/lake/part-0001.parquet.raw", 1048576, 2097152],
+                    ["{{bucket}}/lake/part-0002.parquet.raw", 512, 1048576],
+                    "base64:AAECAwQ=",
+                    ["{{bucket}}/lake/part-0001.parquet.raw", 0, 100]
+                ]
+            },
+            "old-style.txt": ["{{bucket}}/some/file", 0, 10]
+        }
+    }
+
+A ``refs`` value of ``{"segments": [...]}`` (the only allowed key) declares a
+concatenated file; any other dict value is still inline JSON, and versions 0
+and 1 are interpreted exactly as before. Each segment is either
+
+- a **string**: inline data, encoded as UTF-8, or decoded from base64 if it
+  carries the ``base64:`` prefix (invalid base64 is rejected); or
+- a ``[url, offset, length]`` list: ``length`` bytes of the object at ``url``
+  starting at ``offset``. ``url`` may be ``null`` to use the filesystem's
+  ``target``, and may contain ``{{template}}`` placeholders expanded from
+  ``templates``/``template_overrides`` like other references. ``offset`` and
+  ``length`` must be non-negative integers; a zero ``length`` is legal and
+  fetches nothing.
+
+The segments are stitched in declaration order with no separators,
+de-duplication or reordering - repeated, overlapping or reversed ranges of
+one object appear exactly as declared. The declaration is validated when the
+filesystem is constructed (structure, segment types, non-negative integers,
+base64, expanded URLs/target), raising ``ValueError`` naming the virtual path
+and 0-based segment index; the source objects are not contacted for this.
+
+Reading and random access
+^^^^^^^^^^^^^^^^^^^^^^^^^
+
+The concatenated byte sequence *is* the file content: ``cat_file``'s
+``start``/``end`` slice it like ordinary bytes (including negative and
+out-of-range values), and ``cat``, ``cat_ranges``, ``get_file``, ``open()``,
+the mapping interface and their async counterparts all agree on it. The
+logical size is known from the declaration alone, so ``info``/``ls``/``find``
+report it without any remote request.
+
+Reads only fetch the segments intersecting the requested range, located by
+binary search over the segment boundaries rather than a full scan, so a small
+random read of a huge segmented file downloads only the relevant source
+fragments. Ranges on the same object that touch or overlap are merged, and
+``max_gap``/``max_block`` control merging of neighbours exactly as for
+ordinary references; batch ``cat`` merges ranges across all requested files.
+Through ``open()``, the usual ``cache_type``/``block_size`` policies apply -
+with a cache enabled, reads may prefetch by cache block.
+
+Failure behaviour
+^^^^^^^^^^^^^^^^^
+
+A segment whose source is missing, raises an I/O error, or delivers fewer
+bytes than declared fails the whole read with
+:class:`fsspec.implementations.reference.ReferenceNotReachable` - never a
+silently truncated file. Its ``reference`` is the virtual path, ``target``
+the actual source URL, and the original exception is preserved as
+``__cause__`` (for short reads, an ``OSError`` stating the expected and
+actual lengths). ``cat``'s ``on_error`` and ``cat_ranges``' policies apply at
+the granularity of the whole virtual file or range. Segments outside the
+requested range are never touched, so a broken source only affects reads
+that intersect it, and a failed ``read()`` does not advance the file handle's
+position.
+
+Example: handing lake fragments to a file consumer
+^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^
+
+Any consumer that understands ordinary files can read a stitched view
+directly - here, a header line plus row fragments of two lake objects,
+handed to the CSV reader without staging a copy:
+
+.. code-block:: python
+
+    import csv
+    import fsspec
+
+    fs = fsspec.filesystem(
+        "reference",
+        fo={
+            "version": 2,
+            "refs": {
+                "view.csv": {
+                    "segments": [
+                        "id,name\n",
+                        ["memory://lake/rows-a.bin", 40, 12],
+                        ["memory://lake/rows-b.bin", 0, 12],
+                    ]
+                }
+            },
+        },
+        target_protocol="memory",
+    )
+    with fs.open("view.csv", "rt") as f:
+        rows = list(csv.reader(f))
+
+``save_json`` writes such instances back out as version 2 (pure older
+instances keep version 1), and reloading preserves content, segment order,
+expanded targets and sizes.
+
 Listings Caching
 ----------------
 

@@ -1,4 +1,6 @@
 import base64
+import binascii
+import bisect
 import collections
 import io
 import itertools
@@ -74,6 +76,140 @@ def _decode_inline(part):
     if part.startswith(b"base64:"):
         return base64.b64decode(part[7:])
     return part
+
+
+def _decode_inline_segment(part, path, index):
+    """Decode and validate an inline segment of a concatenated reference.
+
+    Unlike ``_decode_inline`` this rejects invalid base64, because a
+    concatenated file is validated up front: bad declarations must fail at
+    construction, not at read time.
+    """
+    if part.startswith("base64:"):
+        try:
+            return base64.b64decode(part[7:], validate=True)
+        except binascii.Error as exc:
+            raise ValueError(
+                f"reference {path!r} segment {index}: invalid base64 inline data"
+            ) from exc
+    return part.encode("utf-8")
+
+
+class SegmentedReference:
+    """A version-2 concatenated file: bytes stitched from ordered segments.
+
+    Each segment is either inline data or a byte range of a remote object:
+
+    - ``("i", data)``: ``data`` (bytes) appears verbatim at this position
+    - ``("r", url, offset, length)``: ``length`` bytes of the object at
+      ``url``, starting at ``offset`` within that object
+
+    Segments are concatenated in declaration order, with no separators,
+    de-duplication or reordering; repeated, overlapping or reversed ranges
+    of one object are fetched exactly as declared. ``cumulative`` holds the
+    prefix sums of the segment lengths, so the segments intersecting a
+    logical byte range are found by binary search rather than a full scan.
+    """
+
+    __slots__ = ("segments", "cumulative", "size")
+
+    def __init__(self, segments):
+        self.segments = tuple(segments)
+        cumulative = [0]
+        for seg in self.segments:
+            cumulative.append(
+                cumulative[-1] + (len(seg[1]) if seg[0] == "i" else seg[3])
+            )
+        self.cumulative = tuple(cumulative)
+        self.size = cumulative[-1]
+
+    def pieces(self, start, end):
+        """Yield the pieces covering logical range ``[start, end)``, in order.
+
+        Yields ``("i", bytes)`` for inline data and ``("r", url, s, e)``
+        (with ``e > s``) for a remote fetch. Segments not intersecting the
+        range are not touched, and zero-length intersections yield nothing.
+        """
+        if start >= end:
+            return
+        cum = self.cumulative
+        segments = self.segments
+        # first segment whose end is strictly beyond start
+        i = bisect.bisect_right(cum, start) - 1
+        while i < len(segments) and cum[i] < end:
+            seg = segments[i]
+            a = max(start, cum[i]) - cum[i]
+            b = min(end, cum[i + 1]) - cum[i]
+            if seg[0] == "i":
+                yield ("i", seg[1][a:b])
+            elif b > a:
+                yield ("r", seg[1], seg[2] + a, seg[2] + b)
+            i += 1
+
+    def to_json(self):
+        """This reference as a JSON-serialisable ``{"segments": [...]}`` value.
+
+        Remote URLs are already fully resolved (templates expanded, ``null``
+        replaced by the default target), so a reloaded copy reads the same
+        bytes. Inline data is stored as text when possible, else base64; a
+        text that itself starts with ``"base64:"`` is always encoded, so the
+        original bytes survive the round trip.
+        """
+        out = []
+        for seg in self.segments:
+            if seg[0] == "i":
+                data = seg[1]
+                try:
+                    text = data.decode("utf-8")
+                except UnicodeDecodeError:
+                    text = None
+                if text is not None and not text.startswith("base64:"):
+                    out.append(text)
+                else:
+                    out.append("base64:" + base64.b64encode(data).decode("ascii"))
+            else:
+                out.append([seg[1], seg[2], seg[3]])
+        return {"segments": out}
+
+
+def _segment_slots(ref, start, end):
+    """Lay out the pieces of ``ref`` covering ``[start, end)`` for assembly.
+
+    Returns ``(slots, items, positions)``: ``slots`` holds inline bytes and
+    ``None`` placeholders in final order; ``items`` lists the remote
+    ``(url, start, end)`` fetches; ``positions[k]`` is the slot index that
+    the result of ``items[k]`` must fill.
+    """
+    slots = []
+    items = []
+    positions = []
+    for piece in ref.pieces(start, end):
+        if piece[0] == "i":
+            slots.append(piece[1])
+        else:
+            positions.append(len(slots))
+            slots.append(None)
+            items.append(piece[1:])
+    return slots, items, positions
+
+
+def _extract_from_merged(url, start, end, mpaths, mstarts, mends, fetched):
+    """Slice one item's bytes out of the merged fetch results.
+
+    Returns the bytes, or the exception that the fetch produced, or an
+    OSError when the remote delivered fewer bytes than requested.
+    """
+    for mp, ms, me, data in zip(mpaths, mstarts, mends, fetched):
+        if mp == url and ms <= start and end <= me:
+            if isinstance(data, Exception):
+                return data
+            out = data[start - ms : (end - me) or None]
+            if len(out) < end - start:
+                return OSError(
+                    f"short read of {url}: expected {end - start} bytes, got {len(out)}"
+                )
+            return out
+    return OSError(f"no fetched range covers {url}[{start}:{end}]")
 
 
 def _prot_in_references(path, references):
@@ -647,6 +783,14 @@ class ReferenceFileSystem(AsyncFileSystem):
     {path0: bytes_data, path1: (target_url, offset, size)}
     https://github.com/fsspec/kerchunk/blob/main/README.md
 
+    Reference spec version 2 additionally allows a "concatenated" file, whose
+    content is the ordered stitching of any number of segments, each being
+    inline data or a byte range of (possibly another) remote object:
+    ``{"segments": ["inline text", "base64:ZGF0YQ==", [url, offset, length],
+    ...]}``. Versions 0 and 1 are unchanged; only version 2 interprets a
+    ``refs`` dict with a ``segments`` key this way - any other dict value is
+    still inline JSON. See the "Reference filesystem" section of the docs.
+
     simple_references: if True (default), no jinja interpreting is done,
         which is the safe option.
     """
@@ -794,8 +938,14 @@ class ReferenceFileSystem(AsyncFileSystem):
             for ref in self.references.values():
                 if callable(ref):
                     ref = ref()
-                if isinstance(ref, list) and ref[0]:
-                    protocol, _ = fsspec.core.split_protocol(ref[0])
+                if isinstance(ref, SegmentedReference):
+                    url = next((s[1] for s in ref.segments if s[0] == "r"), None)
+                elif isinstance(ref, list) and ref[0]:
+                    url = ref[0]
+                else:
+                    continue
+                if url:
+                    protocol, _ = fsspec.core.split_protocol(url)
                     if protocol not in self.fss:
                         fs = filesystem(protocol, **(remote_options or {}))
                         self.fss[protocol] = fs
@@ -824,6 +974,10 @@ class ReferenceFileSystem(AsyncFileSystem):
             part = self.references[path]
         except KeyError as exc:
             raise FileNotFoundError(path) from exc
+        if isinstance(part, SegmentedReference):
+            # logical offsets, resolved like slicing the concatenated bytes
+            start1, end1, _ = slice(start, end).indices(part.size)
+            return part, start1, end1
         if isinstance(part, str):
             part = part.encode()
         if hasattr(part, "to_bytes"):
@@ -865,6 +1019,8 @@ class ReferenceFileSystem(AsyncFileSystem):
         part_or_url, start0, end0 = self._cat_common(path, start=start, end=end)
         if isinstance(part_or_url, bytes):
             return part_or_url[start:end]
+        if isinstance(part_or_url, SegmentedReference):
+            return await self._read_segments_async(path, part_or_url, start0, end0)
         protocol, _ = split_protocol(part_or_url)
         try:
             return await self.fss[protocol]._cat_file(
@@ -877,11 +1033,93 @@ class ReferenceFileSystem(AsyncFileSystem):
         part_or_url, start0, end0 = self._cat_common(path, start=start, end=end)
         if isinstance(part_or_url, bytes):
             return part_or_url[start:end]
+        if isinstance(part_or_url, SegmentedReference):
+            return self._read_segments(path, part_or_url, start0, end0)
         protocol, _ = split_protocol(part_or_url)
         try:
             return self.fss[protocol].cat_file(part_or_url, start=start0, end=end0)
         except Exception as e:
             raise ReferenceNotReachable(path, part_or_url) from e
+
+    def _plan_fetches(self, items):
+        """Group remote item ranges by protocol and merge adjacent ones.
+
+        ``items`` is a list of ``(url, start, end)`` with concrete bounds.
+        Returns a list of ``(protocol, item_indices, merged_paths,
+        merged_starts, merged_ends)``; merging follows this instance's
+        ``max_gap``/``max_block`` settings.
+        """
+        groups = {}
+        for idx, (url, start, end) in enumerate(items):
+            protocol, _ = split_protocol(url)
+            groups.setdefault(protocol, []).append(idx)
+        plans = []
+        for protocol, idxs in groups.items():
+            paths = [items[i][0] for i in idxs]
+            starts = [items[i][1] for i in idxs]
+            ends = [items[i][2] for i in idxs]
+            mpaths, mstarts, mends = merge_offset_ranges(
+                paths,
+                starts,
+                ends,
+                sort=True,
+                max_gap=self.max_gap,
+                max_block=self.max_block,
+            )
+            plans.append((protocol, idxs, mpaths, mstarts, mends))
+        return plans
+
+    @staticmethod
+    def _collect_items(items, plans, fetched_per_plan):
+        """Distribute merged fetch results back to their items, in order."""
+        out = [None] * len(items)
+        for (_, idxs, mpaths, mstarts, mends), fetched in zip(plans, fetched_per_plan):
+            for i in idxs:
+                url, start, end = items[i]
+                out[i] = _extract_from_merged(
+                    url, start, end, mpaths, mstarts, mends, fetched
+                )
+        return out
+
+    def _fetch_items(self, items):
+        """Fetch remote ``(url, start, end)`` items; bytes or exception each."""
+        plans = self._plan_fetches(items)
+        fetched = [
+            self.fss[protocol].cat_ranges(mpaths, mstarts, mends)
+            for protocol, _, mpaths, mstarts, mends in plans
+        ]
+        return self._collect_items(items, plans, fetched)
+
+    async def _fetch_items_async(self, items):
+        """Async variant of ``_fetch_items`` using the targets' async API."""
+        plans = self._plan_fetches(items)
+        fetched = [
+            await self.fss[protocol]._cat_ranges(mpaths, mstarts, mends)
+            for protocol, _, mpaths, mstarts, mends in plans
+        ]
+        return self._collect_items(items, plans, fetched)
+
+    def _read_segments(self, path, ref, start, end):
+        """Read the logical range ``[start, end)`` of a concatenated file."""
+        slots, items, positions = _segment_slots(ref, start, end)
+        if items:
+            results = self._fetch_items(items)
+            for pos, (url, _, _), res in zip(positions, items, results):
+                if isinstance(res, Exception):
+                    raise ReferenceNotReachable(path, url) from res
+                slots[pos] = res
+        return b"".join(slots)
+
+    async def _read_segments_async(self, path, ref, start, end):
+        """Async variant of ``_read_segments`` (never blocks the event loop)."""
+        slots, items, positions = _segment_slots(ref, start, end)
+        if items:
+            results = await self._fetch_items_async(items)
+            for pos, (url, _, _), res in zip(positions, items, results):
+                if isinstance(res, Exception):
+                    raise ReferenceNotReachable(path, url) from res
+                slots[pos] = res
+        return b"".join(slots)
 
     def pipe_file(self, path, value, **_):
         """Temporarily add binary data or reference as a file"""
@@ -931,8 +1169,63 @@ class ReferenceFileSystem(AsyncFileSystem):
             raise NotImplementedError
         if isinstance(path, list) and (recursive or any("*" in p for p in path)):
             raise NotImplementedError
+        paths = [path] if isinstance(path, str) else list(path)
+        # concatenated (version 2) references fan out to several remote
+        # ranges per path, so they are fetched in their own merge pass
+        segmented = {}
+        rest = []
+        for p in paths:
+            ref = self.references.get(self._strip_protocol(p))
+            if isinstance(ref, SegmentedReference):
+                segmented[p] = ref
+            else:
+                rest.append(p)
+        out = {}
+        if rest:
+            out.update(self._cat_merged(rest, on_error=on_error, **kwargs))
+        if segmented:
+            out.update(self._cat_segmented(segmented, on_error=on_error))
+        if len(out) == 1 and isinstance(path, str) and "*" not in path:
+            return _first(out)
+        return out
+
+    def _cat_segmented(self, segmented, on_error="raise"):
+        """Fetch whole concatenated files, merging ranges across all of them.
+
+        ``segmented`` maps paths to their SegmentedReference, in request
+        order. A path whose any segment fails produces one
+        ReferenceNotReachable for the whole file, never partial bytes.
+        """
+        out = {}
+        all_items = []
+        per_path = {}
+        for p, ref in segmented.items():
+            slots, items, positions = _segment_slots(ref, 0, ref.size)
+            base = len(all_items)
+            all_items.extend(items)
+            per_path[p] = (slots, positions, items, base)
+        results = self._fetch_items(all_items) if all_items else []
+        for p, (slots, positions, items, base) in per_path.items():
+            error = None
+            for k, (pos, item) in enumerate(zip(positions, items)):
+                res = results[base + k]
+                if isinstance(res, Exception):
+                    error = ReferenceNotReachable(p, item[0])
+                    error.__cause__ = res
+                    break
+                slots[pos] = res
+            if error is None:
+                out[p] = b"".join(slots)
+            elif on_error == "raise":
+                raise error
+            elif on_error != "omit":
+                out[p] = error
+        return out
+
+    def _cat_merged(self, paths, on_error="raise", **kwargs):
+        """Fetch non-segmented references with range merging; returns a dict."""
         # TODO: if references is lazy, pre-fetch all paths in batch before access
-        proto_dict = _protocol_groups(path, self.references)
+        proto_dict = _protocol_groups(paths, self.references)
         out = {}
         for proto, paths in proto_dict.items():
             fs = self.fss[proto]
@@ -1022,8 +1315,6 @@ class ReferenceFileSystem(AsyncFileSystem):
                 else:
                     del out[k]
 
-        if len(out) == 1 and isinstance(path, str) and "*" not in path:
-            return _first(out)
         return out
 
     def _process_references(self, references, template_overrides=None):
@@ -1032,6 +1323,8 @@ class ReferenceFileSystem(AsyncFileSystem):
             self._process_references0(references)
         elif vers == 1:
             self._process_references1(references, template_overrides=template_overrides)
+        elif vers == 2:
+            self._process_references2(references, template_overrides=template_overrides)
         else:
             raise ValueError(f"Unknown reference spec version: {vers}")
         # TODO: we make dircache by iterating over all entries, but for Spec >= 1,
@@ -1085,10 +1378,118 @@ class ReferenceFileSystem(AsyncFileSystem):
                 self.references[k] = v
         self.references.update(self._process_gen(references.get("gen", [])))
 
+    def _process_references2(self, references, template_overrides=None):
+        """Make reference dict for Spec Version 2
+
+        Like version 1 (refs/templates/gen keep their meaning), except that
+        a refs value of ``{"segments": [...]}`` declares a concatenated file
+        and is validated here. Any other dict value remains inline JSON.
+        The caller's structures are never mutated.
+        """
+        if not self.simple_templates or self.templates:
+            import jinja2.sandbox
+        self.references = {}
+        self._process_templates(references.get("templates", {}))
+
+        @lru_cache(1000)
+        def _render_jinja(u):
+            return (
+                jinja2.sandbox.SandboxedEnvironment()
+                .from_string(u)
+                .render(**self.templates)
+            )
+
+        def _expand(u):
+            if "{{" in u:
+                if self.simple_templates:
+                    u = u.replace("{{", "{").replace("}}", "}").format(**self.templates)
+                else:
+                    u = _render_jinja(u)
+            return u
+
+        for k, v in references.get("refs", {}).items():
+            if isinstance(v, str):
+                if v.startswith("base64:"):
+                    self.references[k] = base64.b64decode(v[7:])
+                self.references[k] = v
+            elif isinstance(v, dict):
+                if "segments" in v:
+                    self.references[k] = self._make_segmented(k, v, _expand)
+                else:
+                    self.references[k] = json.dumps(v)
+            elif isinstance(v, (list, tuple)) and self.templates:
+                u = _expand(v[0])
+                self.references[k] = [u] if len(v) == 1 else [u, v[1], v[2]]
+            else:
+                self.references[k] = v
+        self.references.update(self._process_gen(references.get("gen", [])))
+
+    def _make_segmented(self, path, spec, expand):
+        """Validate one ``{"segments": [...]}`` entry and build the reference.
+
+        Raises ValueError locating the virtual path and the 0-based segment
+        index; the source objects are never contacted here.
+        """
+        if set(spec) != {"segments"}:
+            raise ValueError(
+                f"reference {path!r}: a concatenated file may only have the "
+                f"'segments' key, got {sorted(spec)}"
+            )
+        segs = spec["segments"]
+        if not isinstance(segs, list):
+            raise ValueError(
+                f"reference {path!r}: 'segments' must be a list, "
+                f"got {type(segs).__name__}"
+            )
+        parsed = []
+        for i, seg in enumerate(segs):
+            if isinstance(seg, str):
+                parsed.append(("i", _decode_inline_segment(seg, path, i)))
+                continue
+            if not isinstance(seg, (list, tuple)):
+                raise ValueError(
+                    f"reference {path!r} segment {i}: must be an inline string "
+                    f"or a [url, offset, length] list, got {type(seg).__name__}"
+                )
+            if len(seg) != 3:
+                raise ValueError(
+                    f"reference {path!r} segment {i}: expected "
+                    f"[url, offset, length], got {len(seg)} elements"
+                )
+            url, offset, length = seg
+            if url is None:
+                url = self.target
+                if not isinstance(url, str) or not url:
+                    raise ValueError(
+                        f"reference {path!r} segment {i}: null url requires a "
+                        f"valid default target"
+                    )
+            elif not isinstance(url, str) or not url:
+                raise ValueError(
+                    f"reference {path!r} segment {i}: url must be a non-empty "
+                    f"string or null"
+                )
+            elif self.templates:
+                url = expand(url)
+                if not url:
+                    raise ValueError(
+                        f"reference {path!r} segment {i}: url expanded to an "
+                        f"empty string"
+                    )
+            for name, val in (("offset", offset), ("length", length)):
+                if isinstance(val, bool) or not isinstance(val, int) or val < 0:
+                    raise ValueError(
+                        f"reference {path!r} segment {i}: {name} must be a "
+                        f"non-negative integer, got {val!r}"
+                    )
+            parsed.append(("r", url, offset, length))
+        return SegmentedReference(parsed)
+
     def _process_templates(self, tmp):
         self.templates = {}
         if self.template_overrides is not None:
-            tmp.update(self.template_overrides)
+            # copy: the caller's templates dict must not be modified
+            tmp = {**tmp, **self.template_overrides}
         for k, v in tmp.items():
             if "{{" in v:
                 import jinja2.sandbox
@@ -1158,6 +1559,8 @@ class ReferenceFileSystem(AsyncFileSystem):
         for path, part in it:
             if isinstance(part, (bytes, str)) or hasattr(part, "to_bytes"):
                 size = len(_inline_data(part))
+            elif isinstance(part, SegmentedReference):
+                size = part.size
             elif len(part) == 1:
                 size = None
             else:
@@ -1188,6 +1591,15 @@ class ReferenceFileSystem(AsyncFileSystem):
         # That does mean `_cat_common` gets called twice if it eventually reaches `ReferenceFile`.
         if isinstance(part_or_url, bytes):
             return io.BytesIO(part_or_url[start0:end0])
+        if isinstance(part_or_url, SegmentedReference):
+            return SegmentedReferenceFile(
+                self,
+                path,
+                mode,
+                block_size=block_size,
+                cache_options=cache_options,
+                **kwargs,
+            )
 
         protocol, _ = split_protocol(part_or_url)
         if start0 is None and end0 is None:
@@ -1267,6 +1679,9 @@ class ReferenceFileSystem(AsyncFileSystem):
         if out is not None:
             if isinstance(out, (str, bytes)):
                 return {"name": path, "type": "file", "size": len(_inline_data(out))}
+            elif isinstance(out, SegmentedReference):
+                # logical size is known from the declaration alone
+                return {"name": path, "type": "file", "size": out.size}
             elif len(out) > 1:
                 return {"name": path, "type": "file", "size": out[2]}
             else:
@@ -1318,10 +1733,19 @@ class ReferenceFileSystem(AsyncFileSystem):
         self.dircache.clear()  # this is a bit heavy handed
 
     def save_json(self, url, **storage_options):
-        """Write modified references into new location"""
+        """Write modified references into new location
+
+        Instances containing concatenated (segmented) references are saved
+        as spec version 2; instances with only older entry forms keep being
+        saved as version 1.
+        """
         out = {}
+        version = 1
         for k, v in self.references.items():
-            if isinstance(v, bytes):
+            if isinstance(v, SegmentedReference):
+                version = 2
+                out[k] = v.to_json()
+            elif isinstance(v, bytes):
                 try:
                     out[k] = v.decode("ascii")
                 except UnicodeDecodeError:
@@ -1329,7 +1753,7 @@ class ReferenceFileSystem(AsyncFileSystem):
             else:
                 out[k] = v
         with fsspec.open(url, "wb", **storage_options) as f:
-            f.write(json.dumps({"version": 1, "refs": out}).encode())
+            f.write(json.dumps({"version": version, "refs": out}).encode())
 
 
 class ReferenceFile(AbstractBufferedFile):
@@ -1385,3 +1809,23 @@ class ReferenceFile(AbstractBufferedFile):
         end = min(end + self.start, self.end)
         self.f.seek(start)
         return self.f.read(end - start)
+
+
+class SegmentedReferenceFile(AbstractBufferedFile):
+    """File-like handle over a concatenated (version 2) reference.
+
+    Reads are served by the segments intersecting the requested range only;
+    the usual ``cache_type``/``block_size`` policies apply on top, so a
+    caching layer may prefetch by cache block. No source resource is held
+    between reads, and the borrowed target filesystems are never closed
+    here.
+    """
+
+    def __init__(self, fs, path, mode="rb", **kwargs):
+        ref = fs.references[path]
+        kwargs["size"] = ref.size
+        super().__init__(fs, path, mode=mode, **kwargs)
+        self.ref = ref
+
+    def _fetch_range(self, start, end):
+        return self.fs._read_segments(self.path, self.ref, start, end)

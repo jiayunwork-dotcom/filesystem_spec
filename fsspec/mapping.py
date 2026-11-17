@@ -123,13 +123,49 @@ class FSMap(MutableMapping):
         Parameters
         ----------
         values_dict: dict(str, bytes)
+
+        When the wrapped filesystem is inside a transaction whose type
+        supports nested savepoints, the whole call is one local unit: a
+        conversion or write failure restores the view that existed when the
+        call began, while earlier outer work survives and the original error
+        is re-raised to the caller.
         """
-        values = {self._key_to_str(k): maybe_convert(v) for k, v in values_dict.items()}
-        self.fs.pipe(values)
+        tx = getattr(self.fs, "_transaction", None)
+        if tx is not None and getattr(tx, "supports_savepoints", False):
+            with tx.savepoint():
+                # Convert every value before any write, so that a bad value
+                # rolls back without producing a partial batch.
+                values = {
+                    self._key_to_str(k): maybe_convert(v)
+                    for k, v in values_dict.items()
+                }
+                self.fs.pipe(values)
+        else:
+            values = {
+                self._key_to_str(k): maybe_convert(v)
+                for k, v in values_dict.items()
+            }
+            self.fs.pipe(values)
 
     def delitems(self, keys):
-        """Remove multiple keys from the store"""
-        self.fs.rm([self._key_to_str(k) for k in keys])
+        """Remove multiple keys from the store
+
+        Inside a savepoint-capable transaction the call is atomic at the
+        savepoint level: if any key is missing (or a delete fails), the view
+        returns to its state before the call and the error propagates.
+        """
+        paths = [self._key_to_str(k) for k in keys]
+        tx = getattr(self.fs, "_transaction", None)
+        if tx is not None and getattr(tx, "supports_savepoints", False):
+            with tx.savepoint():
+                # Validate before mutating: deleting a missing key must abort
+                # the whole batch, preserving prior outer work.
+                for p in paths:
+                    if not self.fs.exists(p):
+                        raise FileNotFoundError(p)
+                self.fs.rm(paths)
+        else:
+            self.fs.rm(paths)
 
     def _key_to_str(self, key):
         """Generate full path for the key"""

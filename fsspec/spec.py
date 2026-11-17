@@ -1292,8 +1292,12 @@ class AbstractFileSystem(metaclass=_Cached):
             text_kwargs = {
                 k: kwargs.pop(k)
                 for k in ["encoding", "errors", "newline"]
-                if k in kwargs
+                if k in kwargs and kwargs.get(k) is not None
             }
+            # None-valued text kwargs are no-ops; drop them so they cannot
+            # leak into the recursive binary open below.
+            for k in ["encoding", "errors", "newline"]:
+                kwargs.pop(k, None)
             return io.TextIOWrapper(
                 self.open(
                     path,

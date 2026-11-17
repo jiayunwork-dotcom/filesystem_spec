@@ -3,6 +3,7 @@ from __future__ import annotations
 import inspect
 import logging
 import os
+import shutil
 import tempfile
 import time
 import weakref
@@ -16,6 +17,7 @@ from fsspec.core import BaseCache, MMapCache
 from fsspec.exceptions import BlocksizeMismatchError
 from fsspec.implementations.cache_mapper import create_cache_mapper
 from fsspec.implementations.cache_metadata import CacheMetadata
+from fsspec.savepoint import DELETED, SavepointTransaction
 from fsspec.spec import AbstractBufferedFile
 from fsspec.transaction import Transaction
 from fsspec.utils import infer_compression
@@ -36,6 +38,10 @@ class WriteCachedTransaction(Transaction):
         self.fs._intrans = False
         self.fs._transaction = None
         self.fs = None  # break cycle
+
+
+class SimpleCacheSavepointTransaction(SavepointTransaction):
+    """Nested-savepoint transaction used by :class:`SimpleCacheFileSystem`."""
 
 
 class CachingFileSystem(AbstractFileSystem):
@@ -415,6 +421,9 @@ class CachingFileSystem(AbstractFileSystem):
             "tail",
             "head",
             "info",
+            "size",
+            "du",
+            "glob",
             "ls",
             "exists",
             "isfile",
@@ -438,12 +447,25 @@ class CachingFileSystem(AbstractFileSystem):
             "cache_size",
             "pipe_file",
             "pipe",
+            "rm",
+            "rm_file",
+            "walk",
+            "find",
+            "mkdir",
+            "makedirs",
+            "_overlay",
+            "_evict_cache_file",
+            "_visible_local_path",
             "start_transaction",
             "end_transaction",
         }:
             # all the methods defined in this class. Note `open` here, since
-            # it calls `_open`, but is actually in superclass
-            return lambda *args, **kw: getattr(type(self), item).__get__(self)(
+            # it calls `_open`, but is actually in superclass. Resolve through
+            # the real concrete class: ``type(self)`` below is spoofed to the
+            # target filesystem type by the ``__class__`` override further
+            # down, which would dispatch these methods to the wrong class.
+            real_cls = object.__getattribute__(self, "__class__")
+            return lambda *args, **kw: getattr(real_cls, item).__get__(self)(
                 *args, **kw
             )
         if item in ["__reduce_ex__"]:
@@ -722,11 +744,22 @@ class SimpleCacheFileSystem(WholeFileCacheFileSystem):
     uploaded to the target filesystem; the writability or the target URL is
     not checked until that time.
 
+    Nested savepoints
+    -----------------
+
+    Inside ``with fs.transaction:`` an arbitrary number of nested
+    ``with fs.transaction.savepoint():`` blocks may be opened.  A savepoint
+    that exits normally hands its staged writes to the surrounding level
+    without touching the target; a savepoint that exits with an exception
+    restores the dataset view seen on entry and re-raises.  Only a successful
+    exit of the outermost transaction publishes anything to the target
+    backend.  See :mod:`fsspec.savepoint` for the full contract and its
+    memory/disk trade-offs.
     """
 
     protocol = "simplecache"
     local_file = True
-    transaction_type = WriteCachedTransaction
+    transaction_type = SimpleCacheSavepointTransaction
 
     def __init__(self, **kwargs):
         kw = kwargs.copy()
@@ -737,6 +770,7 @@ class SimpleCacheFileSystem(WholeFileCacheFileSystem):
             if not os.path.exists(storage):
                 os.makedirs(storage, exist_ok=True)
 
+    # ------------------------------------------------------------- plumbing
     def _check_file(self, path):
         self._check_cache()
         sha = self._mapper(path)
@@ -745,62 +779,43 @@ class SimpleCacheFileSystem(WholeFileCacheFileSystem):
             if os.path.exists(fn):
                 return fn
 
+    def start_transaction(self):
+        """Non-context transaction entry; initialises the savepoint overlay."""
+        self._intrans = True
+        self._transaction = self.transaction_type(self)
+        self._transaction.start()
+        return self._transaction
+
+    def _overlay(self):
+        """The active savepoint overlay, or ``None`` outside a transaction."""
+        if self._intrans and self._transaction is not None:
+            return getattr(self._transaction, "_overlay", None)
+        return None
+
+    def _evict_cache_file(self, path):
+        """Remove any warm-cache copy of *path* (tombstones must stick)."""
+        sha = self._mapper(path)
+        for storage in self.storage:
+            fn = os.path.join(storage, sha)
+            try:
+                os.remove(fn)
+            except FileNotFoundError:
+                pass
+        self._cache_size = None
+
     def save_cache(self):
         pass
 
     def load_cache(self):
         pass
 
+    # -------------------------------------------------------- write entries
     def pipe_file(self, path, value=None, **kwargs):
         if self._intrans:
             with self.open(path, "wb") as f:
                 f.write(value)
         else:
             super().pipe_file(path, value)
-
-    def ls(self, path, detail=True, **kwargs):
-        path = self._strip_protocol(path)
-        details = []
-        try:
-            details = self.fs.ls(
-                path, detail=True, **kwargs
-            ).copy()  # don't edit original!
-        except FileNotFoundError as e:
-            ex = e
-        else:
-            ex = None
-        if self._intrans:
-            path1 = path.rstrip("/") + "/"
-            for f in self.transaction.files:
-                if f.path == path:
-                    details.append(
-                        {"name": path, "size": f.size or f.tell(), "type": "file"}
-                    )
-                elif f.path.startswith(path1):
-                    if f.path.count("/") == path1.count("/"):
-                        details.append(
-                            {"name": f.path, "size": f.size or f.tell(), "type": "file"}
-                        )
-                    else:
-                        dname = "/".join(f.path.split("/")[: path1.count("/") + 1])
-                        details.append({"name": dname, "size": 0, "type": "directory"})
-        if ex is not None and not details:
-            raise ex
-        if detail:
-            return details
-        return sorted(_["name"] for _ in details)
-
-    def info(self, path, **kwargs):
-        path = self._strip_protocol(path)
-        if self._intrans:
-            f = [_ for _ in self.transaction.files if _.path == path]
-            if f:
-                size = os.path.getsize(f[0].fn) if f[0].closed else f[0].tell()
-                return {"name": path, "size": size, "type": "file"}
-            f = any(_.path.startswith(path + "/") for _ in self.transaction.files)
-            if f:
-                return {"name": path, "size": 0, "type": "directory"}
-        return self.fs.info(path, **kwargs)
 
     def pipe(self, path, value=None, **kwargs):
         if isinstance(path, str):
@@ -811,41 +826,318 @@ class SimpleCacheFileSystem(WholeFileCacheFileSystem):
         else:
             raise ValueError("path must be str or dict")
 
+    # ------------------------------------------------------------- deletion
+    def rm_file(self, path):
+        """Delete one file, honouring the active savepoint view.
+
+        The savepoint contract only covers file deletes: directory entries
+        produced by a recursive :meth:`rm` are implicit (they vanish once the
+        files beneath them are tombstoned) and are not journaled.
+        """
+        overlay = self._overlay()
+        if overlay is None:
+            # Preserve the historical direct passthrough outside transactions.
+            self.fs.rm_file(self._strip_protocol(path))
+            return
+        path = self._strip_protocol(path)
+        if not self.isfile(path):
+            # Directory or missing path: mirror the backend's behaviour.
+            if not self.exists(path):
+                raise FileNotFoundError(path)
+            return
+        if overlay.is_deleted(path):
+            raise FileNotFoundError(path)
+        overlay.record_delete(path)
+        # The warm-cache copy (and any outer staging file) must not let the key
+        # reappear through this cache instance.
+        self._evict_cache_file(path)
+
+    def rm(self, path, recursive=False, maxdepth=None):
+        if not self._intrans:
+            return super().rm(path, recursive=recursive, maxdepth=maxdepth)
+        # Expand against the overlay-aware ls/exists so that deletes inside a
+        # transaction see the same dataset the writer does.
+        paths = self.expand_path(path, recursive=recursive, maxdepth=maxdepth)
+        for p in reversed(paths):
+            self.rm_file(p)
+
+    def mkdir(self, path, create_parents=True, **kwargs):
+        # Directory creation carries no data and must not be observable by an
+        # independent backend watcher before the outer transaction publishes.
+        if self._intrans:
+            return
+        return self.fs.mkdir(path, create_parents=create_parents, **kwargs)
+
+    def makedirs(self, path, exist_ok=False):
+        # FSMap creates parent dirs up front: suppress those in-transaction so
+        # an independent observer sees no namespace changes before commit.
+        # LocalFileSystem.put_file() reaches this with exist_ok=True at
+        # publish time, when the target directories genuinely are needed, so
+        # that call is allowed through.
+        if self._intrans and not exist_ok:
+            return
+        return self.fs.makedirs(path, exist_ok=exist_ok)
+
+    # --------------------------------------------------------------- reads
+    def cat(self, path, recursive=False, on_error="raise", **kwargs):
+        overlay = self._overlay()
+        if overlay is None or (
+            not isinstance(path, (list, tuple)) and not recursive
+        ):
+            if overlay is not None and not isinstance(path, (list, tuple)):
+                p = self._strip_protocol(path)
+                if overlay.is_deleted(p):
+                    raise FileNotFoundError(p)
+            return AbstractFileSystem.cat(
+                self, path, recursive=recursive, on_error=on_error, **kwargs
+            )
+        # Multi-path / recursive form while a transaction is active: resolve
+        # against the overlay instead of the target's expand_path.
+        paths = self.expand_path(path, recursive=recursive, **kwargs)
+        out = {}
+        for p in paths:
+            try:
+                if overlay.is_deleted(p):
+                    raise FileNotFoundError(p)
+                out[p] = self.cat_file(p, **kwargs)
+            except Exception as e:
+                if on_error == "raise":
+                    raise
+                if on_error == "return":
+                    out[p] = e
+        return out
+
     def cat_ranges(
         self, paths, starts, ends, max_gap=None, on_error="return", **kwargs
     ):
+        overlay = self._overlay()
+        if overlay is not None:
+            for p in paths:
+                if overlay.is_deleted(self._strip_protocol(p)):
+                    raise FileNotFoundError(p)
         lpaths = [self._check_file(p) for p in paths]
         rpaths = [p for l, p in zip(lpaths, paths) if l is False]
         lpaths = [l for l, p in zip(lpaths, paths) if l is False]
         self.fs.get(rpaths, lpaths)
-        return super().cat_ranges(
-            paths, starts, ends, max_gap=max_gap, on_error=on_error, **kwargs
+        return AbstractFileSystem.cat_ranges(
+            self, paths, starts, ends, max_gap=max_gap, on_error=on_error, **kwargs
+        )
+
+    def ls(self, path, detail=True, include_self=False, **kwargs):
+        path = self._strip_protocol(path)
+        details = []
+        ex = None
+        try:
+            details = self.fs.ls(path, detail=True, **kwargs).copy()
+        except FileNotFoundError as e:
+            ex = e
+
+        overlay = self._overlay()
+        if overlay is not None:
+            path1 = path.rstrip("/") + "/"
+            visible = overlay.effective_entries()
+            by_name = {d["name"].rstrip("/"): d for d in details}
+            has_overlay_child = False
+            for logical, entry in visible.items():
+                if entry.kind == "delete":
+                    by_name.pop(logical, None)
+                    continue
+                if logical == path:
+                    by_name[logical] = {
+                        "name": path,
+                        "size": overlay.size_of(logical) or 0,
+                        "type": "file",
+                    }
+                elif logical.startswith(path1):
+                    has_overlay_child = True
+                    if logical.count("/") == path1.count("/"):
+                        by_name[logical] = {
+                            "name": logical,
+                            "size": overlay.size_of(logical) or 0,
+                            "type": "file",
+                        }
+                    else:
+                        dname = "/".join(
+                            logical.split("/")[: path1.count("/") + 1]
+                        )
+                        by_name.setdefault(
+                            dname, {"name": dname, "size": 0, "type": "directory"}
+                        )
+            details = list(by_name.values())
+            # The target may not know a directory that only exists in the
+            # overlay (e.g. a mapper root freshly populated in the tx). Keep
+            # a self directory-marker so walk/find can recurse; public ls
+            # callers get it stripped via include_self=False.
+            if has_overlay_child and ex is not None:
+                ex = None
+                details.append(
+                    {"name": path, "size": 0, "type": "directory", "_self": True}
+                )
+
+        if ex is not None and not details:
+            raise ex
+        if detail:
+            if include_self:
+                return [{k: v for k, v in d.items() if k != "_self"} for d in details]
+            return [d for d in details if not d.pop("_self", False)]
+        return sorted(
+            d["name"]
+            for d in details
+            if (include_self or not d.get("_self", False))
+            and (include_self or d["name"].rstrip("/") != path)
+        )
+
+    def walk(self, path, *args, **kwargs):
+        if self._intrans:
+            kwargs.setdefault("include_self", True)
+        return super().walk(path, *args, **kwargs)
+
+    def find(self, path, *args, **kwargs):
+        if self._intrans:
+            kwargs.setdefault("include_self", True)
+        return super().find(path, *args, **kwargs)
+
+    def info(self, path, **kwargs):
+        path = self._strip_protocol(path)
+        overlay = self._overlay()
+        if overlay is not None:
+            resolved = overlay.resolve(path)
+            if resolved is DELETED:
+                raise FileNotFoundError(path)
+            if resolved is not None:
+                return {
+                    "name": path,
+                    "size": overlay.size_of(path) or 0,
+                    "type": "file",
+                }
+            prefix = path.rstrip("/") + "/"
+            if any(
+                p.startswith(prefix)
+                for p in overlay.effective_entries()
+                if not overlay.is_deleted(p)
+            ):
+                return {"name": path, "size": 0, "type": "directory"}
+        return self.fs.info(path, **kwargs)
+
+    def size(self, path):
+        """Visible size of *path* without materialising its bytes."""
+        return self.info(path).get("size", None)
+
+    # --------------------------------------------------------------- open
+    def open(self, path, mode="rb", block_size=None, cache_options=None,
+             compression=None, **kwargs):
+        """Open a file, honouring the active savepoint overlay.
+
+        Text mode is handled here rather than relying on the base class'
+        recursive ``self.open`` call, which does not survive the
+        ``__getattribute__``/``__class__`` interception used by caching
+        filesystems.
+        """
+        import io
+
+        path = self._strip_protocol(path)
+        if "b" not in mode:
+            text_kwargs = {
+                k: kwargs.pop(k)
+                for k in ("encoding", "errors", "newline")
+                if k in kwargs and kwargs[k] is not None
+            }
+            for k in ("encoding", "errors", "newline"):
+                kwargs.pop(k, None)
+            binary = self._open(
+                path,
+                mode=mode.replace("t", "") + "b",
+                block_size=block_size,
+                cache_options=cache_options,
+                **kwargs,
+            )
+            if compression is not None:
+                from fsspec.core import get_compression
+
+                compression = get_compression(path, compression)
+                binary = compr[compression](binary, mode="r")
+            return io.TextIOWrapper(binary, **text_kwargs)
+        return AbstractFileSystem.open(
+            self,
+            path,
+            mode,
+            block_size=block_size,
+            cache_options=cache_options,
+            compression=compression,
+            **kwargs,
         )
 
     def _open(self, path, mode="rb", **kwargs):
         path = self._strip_protocol(path)
-        sha = self._mapper(path)
 
         if "r" not in mode:
-            fn = os.path.join(self.storage[-1], sha)
+            overlay = self._overlay()
             user_specified_kwargs = {
                 k: v
                 for k, v in kwargs.items()
                 if k not in ["autocommit", "block_size", "cache_options"]
             }  # those were added by open()
-            return LocalTempFile(
+            if overlay is None:
+                fn = os.path.join(self.storage[-1], self._mapper(path))
+                return LocalTempFile(
+                    self,
+                    path,
+                    mode=mode,
+                    autocommit=kwargs.get("autocommit", True),
+                    fn=fn,
+                    **user_specified_kwargs,
+                )
+
+            # Transactional write: the bytes always go to a private staging
+            # file owned by the innermost savepoint.  For append/update modes
+            # seed the staging file with the currently visible bytes first,
+            # streaming on disk so large values are never buffered in Python.
+            append = any(flag in mode for flag in ("a", "+"))
+            if append:
+                source = self._visible_local_path(path, overlay)
+            fn, entry = overlay.allocate(path)
+            if append and source is not None:
+                with open(source, "rb") as src, open(fn, "wb") as dst:
+                    shutil.copyfileobj(src, dst, length=8 * 2**20)
+            f = LocalTempFile(
                 self,
                 path,
-                mode=mode,
-                autocommit=not self._intrans,
+                # r+b requires an existing file; a create-append starts empty.
+                mode=mode if not append or source is not None else "wb",
+                autocommit=False,
                 fn=fn,
                 **user_specified_kwargs,
             )
+            if "a" in mode and source is not None:
+                # r+b opens at offset zero; append must continue at the end.
+                f.fh.seek(0, os.SEEK_END)
+            entry.handle = weakref.ref(f)
+            overlay.current.handles.add(f)
+            return f
+
+        # ------------------------------------------------------------ read
+        overlay = self._overlay()
+        if overlay is not None:
+            resolved = overlay.resolve(path)
+            if resolved is DELETED:
+                raise FileNotFoundError(path)
+            if resolved is not None:
+                return open(resolved.fn, mode)
         fn = self._check_file(path)
         if fn:
             return open(fn, mode)
 
-        fn = os.path.join(self.storage[-1], sha)
+        sha = self._mapper(path)
+        if overlay is not None:
+            # Cache-miss reads inside a transaction must warm *inside the
+            # overlay work area*, otherwise a rollback would leave stale bytes
+            # in the persistent cache that could resurrect later.
+            read_layer = overlay.current
+            fn = os.path.join(read_layer.directory, f"read-{sha}")
+            if os.path.exists(fn):
+                return open(fn, mode)
+        else:
+            fn = os.path.join(self.storage[-1], sha)
         logger.debug("Copying %s to local cache", path)
         kwargs["mode"] = mode
 
@@ -869,7 +1161,27 @@ class SimpleCacheFileSystem(WholeFileCacheFileSystem):
                     f2.write(data)
         else:
             self.fs.get_file(path, fn)
-        return self._open(path, mode)
+        return open(fn, mode)
+
+    def _visible_local_path(self, path, overlay):
+        """Local file carrying the current visible bytes of *path*, or None."""
+        resolved = overlay.resolve(path)
+        if resolved is DELETED:
+            return None
+        if resolved is not None:
+            return resolved.fn
+        fn = self._check_file(path)
+        if fn:
+            return fn
+        # Not staged and not warmed: pull it from the target backend exactly
+        # like the ordinary read path, then use the resulting cache file.
+        if self.fs.exists(path):
+            sha = self._mapper(path)
+            fn = os.path.join(self.storage[-1], sha)
+            self._mkcache()
+            self.fs.get_file(path, fn)
+            return fn
+        return None
 
 
 class LocalTempFile:
@@ -887,6 +1199,11 @@ class LocalTempFile:
         self.closed = False
         self.autocommit = autocommit
         self.kwargs = kwargs
+        # When a savepoint that created this handle rolls back, the owning
+        # transaction flips this flag.  The staging file has already been
+        # unlinked, so neither close() nor commit() may make the discarded
+        # bytes visible again.
+        self._abandoned = False
 
     def __reduce__(self):
         # always open in r+b to allow continuing writing at a location
@@ -901,20 +1218,31 @@ class LocalTempFile:
     def __exit__(self, exc_type, exc_val, exc_tb):
         self.close()
 
+    def _mark_abandoned(self):
+        """Disassociate this handle from any still-visible journal entry."""
+        self._abandoned = True
+        self.autocommit = False
+
     def close(self):
         # self.size = self.fh.tell()
         if self.closed:
             return
         self.fh.close()
         self.closed = True
-        if self.autocommit:
+        if self.autocommit and not self._abandoned:
             self.commit()
 
     def discard(self):
-        self.fh.close()
-        os.remove(self.fn)
+        if not self.closed:
+            self.fh.close()
+            self.closed = True
+        if os.path.lexists(self.fn):
+            os.remove(self.fn)
 
     def commit(self):
+        if self._abandoned:
+            # The branch owning this handle was rolled back; never publish.
+            return
         self.fs.put(self.fn, self.path, **self.kwargs)
         # we do not delete local copy - it's still in the cache
 

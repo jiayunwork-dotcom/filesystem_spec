@@ -18,10 +18,15 @@ except ImportError:
     if not TYPE_CHECKING:
         import json
 
-from fsspec.asyn import AsyncFileSystem
+from fsspec.asyn import AsyncFileSystem, sync
 from fsspec.callbacks import DEFAULT_CALLBACK
 from fsspec.core import filesystem, open, split_protocol
 from fsspec.implementations.asyn_wrapper import AsyncFileSystemWrapper
+from fsspec.multirange import (
+    RangePolicyError,
+    validate_cat_ranges_args,
+    validate_range_policy,
+)
 from fsspec.utils import isfilelike, merge_offset_ranges, other_paths
 
 logger = logging.getLogger("fsspec.reference")
@@ -626,6 +631,7 @@ class ReferenceFileSystem(AsyncFileSystem):
         max_gap=64_000,
         max_block=256_000_000,
         cache_size=128,
+        range_policy=None,
         **kwargs,
     ):
         """
@@ -682,6 +688,20 @@ class ReferenceFileSystem(AsyncFileSystem):
             Maximum size of LRU cache, where cache_size*record_size denotes
             the total number of references that can be loaded in memory at once.
             Only used for lazily loaded references.
+        range_policy : dict, optional
+            Enables coalesced multi-range fetching for ``cat`` and
+            ``cat_ranges``. Must be a dict with exactly the keys
+            ``max_ranges``, ``max_request_bytes`` and ``extra_bytes``
+            (non-bool ints; the first two >= 1, the last >= 0); see
+            ``fsspec.multirange`` and
+            ``HTTPFileSystem.cat_ranges`` for the exact semantics. When
+            given, references are resolved to concrete (url, offset) byte
+            ranges first and the HTTP layer plans the physical requests;
+            ``max_gap``/``max_block`` are not used. Only inline data and
+            http(s) references with a known length are supported in this
+            mode - whole-file references and other protocols are rejected
+            with a ValueError before any request is made. When None
+            (default), behaviour is unchanged.
         kwargs : passed to parent class
         """
         super().__init__(**kwargs)
@@ -693,6 +713,10 @@ class ReferenceFileSystem(AsyncFileSystem):
         self._dircache = {}
         self.max_gap = max_gap
         self.max_block = max_block
+        if range_policy is not None:
+            # fail fast, long before any request could be issued
+            validate_range_policy(range_policy)
+        self.range_policy = range_policy
         if isinstance(fo, str):
             dic = dict(
                 **(ref_storage_args or target_options or {}), protocol=target_protocol
@@ -881,6 +905,23 @@ class ReferenceFileSystem(AsyncFileSystem):
             raise NotImplementedError
         if isinstance(path, list) and (recursive or any("*" in p for p in path)):
             raise NotImplementedError
+        if self.range_policy is not None:
+            paths = [path] if isinstance(path, str) else list(path)
+            out = self._cat_policy(paths, on_error)
+            for k, v in out.copy().items():
+                # valid references whose fetch failed: transform the exception
+                if isinstance(v, Exception) and k in self.references:
+                    new_ex = ReferenceNotReachable(k, self.references[k])
+                    new_ex.__cause__ = v
+                    if on_error == "raise":
+                        raise new_ex
+                    elif on_error == "omit":
+                        del out[k]
+                    else:
+                        out[k] = new_ex
+            if len(out) == 1 and isinstance(path, str) and "*" not in path:
+                return _first(out)
+            return out
         # TODO: if references is lazy, pre-fetch all paths in batch before access
         proto_dict = _protocol_groups(path, self.references)
         out = {}
@@ -972,6 +1013,190 @@ class ReferenceFileSystem(AsyncFileSystem):
 
         if len(out) == 1 and isinstance(path, str) and "*" not in path:
             return _first(out)
+        return out
+
+    def _check_policy_target(self, path, url):
+        """Require an http(s) target served by an HTTPFileSystem."""
+        from fsspec.implementations.http import HTTPFileSystem
+
+        proto, _ = split_protocol(url)
+        fs = self.fss.get(proto)
+        if proto not in ("http", "https") or not isinstance(fs, HTTPFileSystem):
+            raise RangePolicyError(
+                "range_policy only supports inline data and http(s) references "
+                f"with a known length; {path!r} resolves to {url!r}"
+            )
+
+    def _cat_policy(self, paths, on_error):
+        """Fetch a batch of references using the coalescing range policy.
+
+        Logical keys are first translated into physical (url, offset)
+        ranges; the HTTP filesystem then plans and issues the requests.
+        """
+        out = {}
+        todo = []  # (path, url, start, end)
+        for p in paths:
+            try:
+                u, s, e = self._cat_common(p)
+                if not isinstance(u, (bytes, str)):
+                    # nan/None from parquet
+                    continue
+            except FileNotFoundError as err:
+                if on_error == "raise":
+                    raise
+                if on_error != "omit":
+                    out[p] = err
+                continue
+            if isinstance(u, bytes):
+                # inline data: no request
+                out[p] = u
+                continue
+            if s is None or e is None:
+                raise RangePolicyError(
+                    "range_policy only supports references with a known "
+                    f"length; {p!r} is a whole-file reference"
+                )
+            self._check_policy_target(p, u)
+            todo.append((p, u, s, e))
+        # all validation is done above, before any request is issued
+        by_fs = {}
+        for p, u, s, e in todo:
+            proto, _ = split_protocol(u)
+            by_fs.setdefault(self.fss[proto], []).append((p, u, s, e))
+        for fs, items in by_fs.items():
+            results = fs.cat_ranges(
+                [i[1] for i in items],
+                [i[2] for i in items],
+                [i[3] for i in items],
+                range_policy=self.range_policy,
+                on_error="return",
+            )
+            for (p, *_), res in zip(items, results):
+                out[p] = res
+        return out
+
+    def _resolve_policy_range(self, path, start, end):
+        """Translate a logical key range into a concrete fetch plan.
+
+        ``start``/``end`` are interpreted relative to the logical key's
+        own length and converted to physical offsets. Returns
+        ``("inline", bytes)`` for inline data or
+        ``("http", (fs, url, start, end))`` for http(s) references.
+        """
+        try:
+            part = self.references[path]
+        except KeyError as exc:
+            raise FileNotFoundError(path) from exc
+        if isinstance(part, str):
+            part = part.encode()
+        if hasattr(part, "to_bytes"):
+            part = part.to_bytes()
+        if isinstance(part, bytes):
+            if part.startswith(b"base64:"):
+                part = base64.b64decode(part[7:])
+            if end > len(part):
+                raise RangePolicyError(
+                    f"range [{start}, {end}) is out of bounds for {path!r} "
+                    f"with length {len(part)}"
+                )
+            return "inline", part[start:end]
+        if not isinstance(part, (list, tuple)) or not part:
+            raise FileNotFoundError(path)
+        if len(part) == 1:
+            raise RangePolicyError(
+                "range_policy only supports references with a known "
+                f"length; {path!r} is a whole-file reference"
+            )
+        url, start0, size = part
+        if url is None:
+            url = self.target
+        if end > size:
+            raise RangePolicyError(
+                f"range [{start}, {end}) is out of bounds for {path!r} "
+                f"with length {size}"
+            )
+        self._check_policy_target(path, url)
+        proto, _ = split_protocol(url)
+        return "http", (self.fss[proto], url, start0 + start, start0 + end)
+
+    def cat_ranges(
+        self, paths, starts, ends, max_gap=None, on_error="return", **kwargs
+    ):
+        """Get the contents of byte ranges from one or more reference keys.
+
+        When this instance was created with a ``range_policy``, ``starts``
+        and ``ends`` are interpreted relative to each key's own length,
+        coalesced multi-range requests are planned from the resulting
+        physical ranges, and the result list aligns with the input
+        (``on_error="return"`` places exceptions, wrapped in
+        ReferenceNotReachable where a reference was involved, at the
+        failing positions; ``on_error="raise"`` raises the first one).
+        Without a ``range_policy``, behaves as before.
+        """
+        if self.range_policy is None:
+            return sync(
+                self.loop,
+                AsyncFileSystem._cat_ranges,
+                self,
+                paths,
+                starts,
+                ends,
+                max_gap=max_gap,
+                on_error=on_error,
+                **kwargs,
+            )
+        if max_gap is not None:
+            raise RangePolicyError("max_gap cannot be combined with range_policy")
+        if on_error not in ("raise", "return"):
+            raise ValueError(
+                "on_error must be 'raise' or 'return' when range_policy is used"
+            )
+        items = validate_cat_ranges_args(paths, starts, ends)
+        out = [b""] * len(items)
+        todo = []  # (index, fs, url, start, end)
+        errors = {}
+        for i, p, s, e in items:
+            try:
+                kind, payload = self._resolve_policy_range(p, s, e)
+            except FileNotFoundError as err:
+                errors[i] = err
+                continue
+            if kind == "inline":
+                out[i] = payload
+            elif e > s:
+                todo.append((i, *payload))
+            # zero-length ranges need no request and stay b""
+        if errors:
+            # missing keys: fail fast before any request, or report in place
+            if on_error == "raise":
+                raise next(iter(errors.values()))
+            for i, err in errors.items():
+                out[i] = err
+        by_fs = {}
+        for i, fs, u, s1, e1 in todo:
+            by_fs.setdefault(fs, []).append((i, u, s1, e1))
+        for fs, group in by_fs.items():
+            results = fs.cat_ranges(
+                [g[1] for g in group],
+                [g[2] for g in group],
+                [g[3] for g in group],
+                range_policy=self.range_policy,
+                on_error="return",
+            )
+            for (i, *_), res in zip(group, results):
+                out[i] = res
+        first_error = None
+        for i, p, _, _ in items:
+            v = out[i]
+            if isinstance(v, Exception) and p in self.references:
+                new_ex = ReferenceNotReachable(p, self.references[p])
+                new_ex.__cause__ = v
+                out[i] = new_ex
+                v = new_ex
+            if isinstance(v, Exception) and first_error is None:
+                first_error = v
+        if on_error == "raise" and first_error is not None:
+            raise first_error
         return out
 
     def _process_references(self, references, template_overrides=None):

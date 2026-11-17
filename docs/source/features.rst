@@ -63,6 +63,116 @@ buffer, you can do
    with fs.open(path, mode='rb', cache_type='readahead') as f:
        use_for_something(f)
 
+.. _multirange:
+
+Coalesced multi-range reads (``range_policy``)
+----------------------------------------------
+
+Workloads such as virtual (kerchunk-style) datasets fetch many small byte
+ranges from the same remote files. Issuing one HTTP request per range is
+wasteful, but reading back the gaps between ranges wholesale wastes
+bandwidth. ``HTTPFileSystem.cat_ranges`` therefore accepts an optional
+``range_policy`` that batches ranges into a controlled number of
+multi-interval ``Range`` requests, and ``ReferenceFileSystem`` accepts the
+same option at construction time and applies it to its ``cat`` and
+``cat_ranges``.
+
+.. code-block:: python
+
+   policy = {"max_ranges": 8, "max_request_bytes": 4096, "extra_bytes": 4096}
+   http = fsspec.filesystem("http")
+   out = http.cat_ranges(urls, starts, ends, range_policy=policy)
+
+   refs = fsspec.filesystem("reference", fo=ref_dict, range_policy=policy)
+   data = refs.cat(keys)                # coalesced
+   slices = refs.cat_ranges(keys, starts, ends)  # offsets per logical key
+
+The policy is a dict with exactly three keys (missing keys, unknown keys
+and illegal values raise ``ValueError`` before any request is made):
+
+- ``max_ranges``: maximum number of byte intervals declared in one
+  request (non-bool int >= 1);
+- ``max_request_bytes``: maximum total source bytes declared in one
+  request (non-bool int >= 1);
+- ``extra_bytes``: call-level budget of *additional* source bytes that may
+  be fetched to bridge gaps between needed ranges (non-bool int >= 0).
+
+With a policy active, ``paths``, ``starts`` and ``ends`` must be lists of
+equal length, and every range must be non-bool ints with
+``0 <= start <= end`` (end exclusive) inside the file. Empty inputs and
+zero-length ranges never issue a request, and invalid input is rejected
+before anything is sent. The result list aligns with the input:
+duplicates are kept, and every item is byte-identical to its own slice.
+Only ranges on the same URL (query string included) share a request.
+
+**Budget accounting.** Let ``U`` be the total length of the union of all
+needed bytes (per URL, then summed). The intervals declared by all GET
+requests of one call sum to at most ``U + extra_bytes``; fetching the
+same byte twice would also count against this, so the planner never does.
+Only source data bytes count, not MIME or HTTP headers. A single input
+range larger than ``max_request_bytes`` is split across several requests
+and reassembled. If a server coalesces adjacent intervals into one
+covering range, the new source bytes are accepted only while they still
+fit the per-request (``max_request_bytes``) and whole-call
+(``U + extra_bytes``) budgets. Response bodies are read with hard
+bounds: at most ``max_request_bytes`` of source data and 64 KiB of MIME
+framing per response, then the stream is aborted with an error.
+
+**Responses and errors.** The client sends real multi-interval ``Range``
+headers with ``Accept-Encoding: identity`` (any other content encoding in
+the response is rejected) and understands both RFC 9110 forms of 206: a
+single range with ``Content-Range`` and ``multipart/byteranges`` (parts
+may be out of order, the boundary may be quoted, and payloads containing
+boundary-like bytes are handled by locating parts via their
+``Content-Range`` and complete MIME boundaries). Missing, duplicate or
+overlapping parts, conflicting total sizes, malformed headers,
+truncation, a 200 that ignores ``Range``, and 416 all fail explicitly -
+short reads are never silently accepted, and there is no whole-file
+fallback. ``on_error="return"`` (default) places the exception at the
+position of each failed input; ``on_error="raise"`` raises the first
+failure after the batch completes. One failed physical request only
+fails the inputs that depend on it. ``ReferenceFileSystem.cat`` keeps
+its ``raise``/``return``/``omit`` modes and wraps fetch failures in
+``ReferenceNotReachable`` tied to the affected logical keys. Failures
+surface as ``fsspec.multirange.RangeResponseError`` (an ``IOError``);
+policy and input violations surface as
+``fsspec.multirange.RangePolicyError`` (a ``ValueError``).
+
+**Reference integration.** With a policy, the reference layer first
+translates logical keys and their slices into physical URL/offset ranges
+and lets the HTTP layer plan the requests; the old ``max_gap``/
+``max_block`` merging is bypassed (so inflated, pre-merged ranges are
+never used as the budget base). ``cat_ranges`` interprets
+``starts``/``ends`` relative to each key's own length. Inline data
+produces no request; whole-file references and non-HTTP(S) targets are
+rejected with ``ValueError`` before any request. Without a policy,
+behaviour is unchanged. The async entry point
+``HTTPFileSystem._cat_ranges`` is wired identically, throttles in-flight
+requests with ``batch_size``, and on cancellation or error finishes the
+current batch, closes responses, and leaves the instance reusable.
+
+**Planning strategy.** The planner (``fsspec.multirange.plan_range_requests``)
+groups ranges by URL, unions them, then sweeps each URL's intervals into
+segments: a segment closes when its byte budget is full, and when its
+interval count would exceed ``max_ranges`` the cheapest gaps inside the
+segment are bridged from the shared ``extra_bytes`` budget. We compared
+this local greedy rule with a batch-global alternative (bridge the
+globally cheapest gaps while an estimated request count decreases, then
+first-fit pack; see ``benchmarks/range_policy.py``). Measured on
+10000-range workloads: dense 64 B blocks at stride 80 give 1218 vs 1250
+requests (greedy vs global), sparse 1 KiB refs over 1 GiB tie at 619,
+skewed cluster/outlier mixes give 109 vs 141, and the 256-block
+benchmark shape gives 5 vs 32 - the global rule under-coalesces whenever
+the interval limit binds before its estimate moves, so the local rule
+was adopted. Its cost is that it may spend ``extra_bytes`` in byte-bound
+regimes without reducing the request count (619 requests, 64 KiB spent,
+in the sparse case above); the budget is a hard cap in both strategies.
+Planning is O(n log n)-ish: ~1 ms for 1000 ranges, ~18 ms for 10000,
+~0.3 s for 100000. Buffering grows with the returned data plus
+``batch_size * max_request_bytes`` of in-flight responses - never with
+the source file length - and the input-to-request mapping is sparse
+(no dense keys x requests matrix).
+
 Transparent text-mode and compression
 -------------------------------------
 

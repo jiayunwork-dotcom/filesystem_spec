@@ -50,6 +50,10 @@ Base Classes
    fsspec.dircache.DirCache
    fsspec.FSMap
    fsspec.generic.GenericFileSystem
+   fsspec.multirange.RangePolicyError
+   fsspec.multirange.RangeResponseError
+   fsspec.multirange.plan_range_requests
+   fsspec.multirange.validate_range_policy
    fsspec.registry.register_implementation
    fsspec.spec.AbstractBufferedFile
    fsspec.spec.AbstractFileSystem
@@ -100,6 +104,14 @@ Base Classes
 
 .. autoclass:: fsspec.spec.Transaction
    :members:
+
+.. autoclass:: fsspec.multirange.RangePolicyError
+
+.. autoclass:: fsspec.multirange.RangeResponseError
+
+.. autofunction:: fsspec.multirange.plan_range_requests
+
+.. autofunction:: fsspec.multirange.validate_range_policy
 
 .. _implementations:
 

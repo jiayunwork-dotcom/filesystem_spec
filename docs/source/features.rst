@@ -106,15 +106,29 @@ duplicates are kept, and every item is byte-identical to its own slice.
 Only ranges on the same URL (query string included) share a request.
 
 **Budget accounting.** Let ``U`` be the total length of the union of all
-needed bytes (per URL, then summed). The intervals declared by all GET
-requests of one call sum to at most ``U + extra_bytes``; fetching the
-same byte twice would also count against this, so the planner never does.
-Only source data bytes count, not MIME or HTTP headers. A single input
-range larger than ``max_request_bytes`` is split across several requests
-and reassembled. If a server coalesces adjacent intervals into one
-covering range, the new source bytes are accepted only while they still
-fit the per-request (``max_request_bytes``) and whole-call
-(``U + extra_bytes``) budgets. Response bodies are read with hard
+needed bytes - computed per full physical URL (query string included) and
+then summed across URLs, so ranges on different URLs never share a byte
+- with inline data and zero-length slices contributing nothing. One
+:class:`~fsspec.multirange.CoalesceBudget` carrying exactly
+``extra_bytes`` belongs to the whole ``cat``/``cat_ranges`` call. The
+planner draws on it when bridging gaps between declared intervals, and
+each accepted response draws on it again for the source bytes a server
+coalesced beyond what the request declared; the two spends together can
+never exceed the original allowance, including when the references are
+served by independent ``HTTPFileSystem`` instances over different
+protocols (plain HTTP and HTTPS, each keeping its own session, headers
+and connection options). Switching backend, protocol or internal
+request batch never grants a fresh allowance. The intervals declared by
+all GET requests of the call therefore sum to at most
+``U + extra_bytes``; fetching the same byte twice would also count
+against this, so the planner never does. Only source data bytes count,
+not MIME or HTTP headers. A single input range larger than
+``max_request_bytes`` is split across several requests and reassembled.
+If a server coalesces adjacent intervals into one covering range, the
+new source bytes are accepted only while they still fit the per-request
+(``max_request_bytes``) and remaining whole-call budgets, and the check
+is global: a response accepted by one backend leaves less slack for every
+other backend of the same call. Response bodies are read with hard
 bounds: at most ``max_request_bytes`` of source data and 64 KiB of MIME
 framing per response, then the stream is aborted with an error.
 
@@ -138,18 +152,29 @@ surface as ``fsspec.multirange.RangeResponseError`` (an ``IOError``);
 policy and input violations surface as
 ``fsspec.multirange.RangePolicyError`` (a ``ValueError``).
 
-**Reference integration.** With a policy, the reference layer first
-translates logical keys and their slices into physical URL/offset ranges
-and lets the HTTP layer plan the requests; the old ``max_gap``/
-``max_block`` merging is bypassed (so inflated, pre-merged ranges are
-never used as the budget base). ``cat_ranges`` interprets
-``starts``/``ends`` relative to each key's own length. Inline data
-produces no request; whole-file references and non-HTTP(S) targets are
-rejected with ``ValueError`` before any request. Without a policy,
-behaviour is unchanged. The async entry point
+**Reference integration.** With a policy, one ``cat`` or
+``cat_ranges`` call is a single planning, budget and validation
+boundary. The reference layer first translates every logical key and
+slice into physical URL/offset ranges and statically validates the
+whole batch - reference type, known length, non-negative offsets,
+in-bounds ranges and policy values - before any GET is issued, so an
+illegal reference fails the entire batch with
+:class:`~fsspec.multirange.RangePolicyError` regardless of key order,
+protocol placement or ``on_error`` (only genuinely missing keys follow
+the ``on_error`` semantics). The old ``max_gap``/``max_block`` merging
+is bypassed (so inflated, pre-merged ranges are never used as the
+budget base). ``cat_ranges`` interprets ``starts``/``ends`` relative to
+each key's own length. Inline data produces no request; whole-file
+references and non-HTTP(S) targets are rejected before any request.
+The physical ranges then execute through their own backends - each
+backend keeps its session, headers and connection options, and URLs are
+never handed to a different instance for merging - while sharing the
+one call-level budget described above. Without a policy, behaviour is
+unchanged. The async entry point
 ``HTTPFileSystem._cat_ranges`` is wired identically, throttles in-flight
 requests with ``batch_size``, and on cancellation or error finishes the
-current batch, closes responses, and leaves the instance reusable.
+current batch, closes responses, and leaves the instance reusable;
+concurrent calls on one instance never share a budget.
 
 **Planning strategy.** The planner (``fsspec.multirange.plan_range_requests``)
 groups ranges by URL, unions them, then sweeps each URL's intervals into

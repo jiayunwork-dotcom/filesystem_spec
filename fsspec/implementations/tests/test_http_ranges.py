@@ -562,7 +562,9 @@ def test_server_coalesces_parts_accepted(h, rserver):
 
 def test_server_coalesce_single_range(h, rserver):
     starts, ends, size = sparse_inputs(n=3, stride=100, length=40)
-    policy = {"max_ranges": 3, "max_request_bytes": 300, "extra_bytes": 200}
+    # max_ranges high enough that the planner itself bridges nothing;
+    # the whole extra budget stays available for the server's coalescing
+    policy = {"max_ranges": 8, "max_request_bytes": 300, "extra_bytes": 200}
     url = data_url(rserver, size, coalesce=1)
     out = h.cat_ranges([url] * 3, starts, ends, range_policy=policy)
     assert out == [gen(s, e) for s, e in zip(starts, ends)]
@@ -570,11 +572,29 @@ def test_server_coalesce_single_range(h, rserver):
 
 
 def test_server_coalesce_exactly_at_budget(h, rserver):
-    # coalesced response uses exactly the remaining call budget
-    policy = {"max_ranges": 2, "max_request_bytes": 100, "extra_bytes": 20}
+    # two disjoint ranges the planner keeps apart, so the coalesced
+    # response can spend exactly the full call budget
+    policy = {"max_ranges": 8, "max_request_bytes": 100, "extra_bytes": 20}
     url = data_url(rserver, 1000, coalesce=1)
     out = h.cat_ranges([url, url], [0, 60], [40, 100], range_policy=policy)
     assert out == [gen(0, 40), gen(60, 100)]
+
+
+def test_server_coalesce_shares_budget_with_planner(h, rserver):
+    # the planner's own gap bridging and a server-coalesced response
+    # draw from the SAME extra_bytes: after the planner spends 20 bytes,
+    # the response may add at most the remaining 5
+    policy = {"max_ranges": 2, "max_request_bytes": 100, "extra_bytes": 25}
+    url = data_url(rserver, 1000, coalesce=1)
+    out = h.cat_ranges([url, url], [0, 60], [40, 100], range_policy=policy)
+    # planner bridges the 20-byte gap (declares [0,100)); server then
+    # adds nothing, so this still succeeds
+    assert out == [gen(0, 40), gen(60, 100)]
+    policy2 = {"max_ranges": 2, "max_request_bytes": 100, "extra_bytes": 19}
+    out = h.cat_ranges([url, url], [0, 60], [40, 100], range_policy=policy2)
+    # planner alone needs 20 bytes, more than the whole budget: it gives
+    # up bridging, declares 80 bytes, then the server adds 20 > 19
+    assert all(isinstance(o, RangeResponseError) for o in out)
 
 
 def test_server_coalesce_over_budget(h, rserver):

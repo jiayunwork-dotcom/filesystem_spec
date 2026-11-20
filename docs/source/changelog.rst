@@ -12,6 +12,11 @@ Enhancements
 
 Fixes
 
+- one ``range_policy`` ``cat``/``cat_ranges`` call is now a single
+  extra-byte budget and static-validation boundary across independent
+  HTTP/HTTPS backends: the budget is no longer claimed once per
+  backend, server-coalesced responses are checked against the remaining
+  shared allowance, and invalid references fail before any GET is sent
 - dir/info consistency in dirfs (#1798)
 - referenceFS async consistency (#1794, 1795)
 - CI (#1793)

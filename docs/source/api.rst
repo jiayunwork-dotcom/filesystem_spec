@@ -50,6 +50,7 @@ Base Classes
    fsspec.dircache.DirCache
    fsspec.FSMap
    fsspec.generic.GenericFileSystem
+   fsspec.multirange.CoalesceBudget
    fsspec.multirange.RangePolicyError
    fsspec.multirange.RangeResponseError
    fsspec.multirange.plan_range_requests
@@ -103,6 +104,9 @@ Base Classes
    :members:
 
 .. autoclass:: fsspec.spec.Transaction
+   :members:
+
+.. autoclass:: fsspec.multirange.CoalesceBudget
    :members:
 
 .. autoclass:: fsspec.multirange.RangePolicyError

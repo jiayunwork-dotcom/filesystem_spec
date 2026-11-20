@@ -27,6 +27,13 @@ Ranges longer than ``max_request_bytes`` are split into several
 requests. The planner never downloads the same byte twice; duplicate or
 contained input ranges are fetched once and mapped back to each input.
 
+A single :class:`CoalesceBudget` holds the ``extra_bytes`` allowance of
+one whole call. A batch whose URLs are served by independent backends is
+planned in per-backend pieces against that one shared object, and the
+same object is later used to validate server-coalesced responses: the
+planner's gap bridging and every accepted response draw from one pool,
+so no backend or execution batch can claim the allowance twice.
+
 The planning strategy is a per-URL left-to-right greedy sweep: union
 intervals are accumulated into a segment until either the byte budget
 of the segment is exhausted (the segment is closed) or the interval
@@ -52,6 +59,33 @@ class RangePolicyError(ValueError):
 
 class RangeResponseError(IOError):
     """A multi-range response was invalid, inconsistent or over budget."""
+
+
+class CoalesceBudget:
+    """The single ``extra_bytes`` budget of one whole batch.
+
+    One instance is shared by every physical request of a call, even when
+    the references resolve to different backend filesystems. The planner
+    draws on it first (the gap-bridging bytes of the declared ranges), and
+    each accepted response draws on it again for the source bytes a
+    server coalesced beyond what that request declared. Check-and-take
+    contains no awaits, so concurrent requests cannot oversubscribe it.
+
+    ``remaining`` is the budget still available for either purpose; the
+    total of planner-drawn and response-drawn bytes can therefore never
+    exceed the original ``extra_bytes``.
+    """
+
+    __slots__ = ("remaining",)
+
+    def __init__(self, remaining):
+        self.remaining = remaining
+
+    def take(self, n, what="the extra_bytes budget"):
+        """Charge ``n`` source bytes, or raise before changing the state."""
+        if n > self.remaining:
+            raise RangeResponseError(f"coalesced response exceeds {what}")
+        self.remaining -= n
 
 
 _POLICY_KEYS = ("max_ranges", "max_request_bytes", "extra_bytes")
@@ -147,12 +181,20 @@ class RangePlan(NamedTuple):
     union_bytes: total length ``U`` of the union of the input ranges.
     declared_bytes: total length of all declared request intervals
         (<= union_bytes + extra_bytes).
+    planner_spend: source bytes the planner itself charged to the
+        budget by bridging gaps (``declared_bytes - union_bytes``).
+    budget: the call-level :class:`CoalesceBudget`, shared across
+        backends when a batch was planned in several pieces; its
+        ``remaining`` field is the slack left for server-coalesced
+        responses after the planner's own gap bridging.
     """
 
     requests: list
     input_map: list
     union_bytes: int
     declared_bytes: int
+    planner_spend: int
+    budget: "CoalesceBudget"
 
 
 def _union_intervals(intervals):
@@ -167,19 +209,16 @@ def _union_intervals(intervals):
     return [(s, e) for s, e in out]
 
 
-def _plan_url(
-    union, max_ranges, max_request_bytes, extra_remaining, requests, segs_out, url
-):
+def _plan_url(union, max_ranges, max_request_bytes, budget, requests, segs_out, url):
     """Greedily pack one URL's union intervals into requests.
 
     Sweeps the sorted union intervals left to right, keeping an open
     segment. A new interval closes the segment if its bytes alone would
     exceed ``max_request_bytes``; if the segment's interval count would
     exceed ``max_ranges``, the smallest gaps in the segment are bridged
-    (charged to the shared ``extra_remaining`` budget) to merge
-    intervals. Appends ``(url, intervals)`` to ``requests`` and, per
-    declared interval, ``(start, end, request_index)`` to ``segs_out``.
-    Returns the remaining extra-bytes budget.
+    (charged to the shared call-level ``budget``) to merge intervals.
+    Appends ``(url, intervals)`` to ``requests`` and, per declared
+    interval, ``(start, end, request_index)`` to ``segs_out``.
     """
     cur = []  # union intervals in the open segment
     gaps = []  # gaps[i] sits between cur[i] and cur[i + 1]
@@ -246,13 +285,13 @@ def _plan_url(
                 cost += g2
             if (
                 len(popped) == needed
-                and cost <= extra_remaining
+                and cost <= budget.remaining
                 and new_src + bridge_bytes + cost <= max_request_bytes
             ):
                 for _, pos in popped:
                     bridged.add(pos)
                 bridge_bytes += cost
-                extra_remaining -= cost
+                budget.take(cost)
             else:
                 for g2, pos in popped:
                     heapq.heappush(unbridged, (g2, pos))
@@ -264,10 +303,9 @@ def _plan_url(
         gaps.append(gap)
         src_bytes = new_src
     emit()
-    return extra_remaining
 
 
-def plan_range_requests(items, max_ranges, max_request_bytes, extra_bytes):
+def plan_range_requests(items, max_ranges, max_request_bytes, extra_bytes, budget=None):
     """Plan coalesced multi-range requests for a batch of ranges.
 
     Parameters
@@ -277,11 +315,22 @@ def plan_range_requests(items, max_ranges, max_request_bytes, extra_bytes):
         no request). URLs compare by full identity, query string
         included: only ranges on the same URL share a request.
     max_ranges, max_request_bytes, extra_bytes: see module docstring.
+    budget: CoalesceBudget, optional
+        A call-level budget shared with other planners and with the
+        response checks. When omitted, a fresh one is created from
+        ``extra_bytes``, which is the behaviour for a standalone call.
+        When supplied, only its currently remaining bytes may be spent
+        on gap bridging and the same object is returned in the plan, so
+        several backends planning sequentially draw from one budget.
 
     Returns
     -------
-    RangePlan
+    RangePlan plus a ``budget`` attribute carrying the (possibly shared)
+    budget object whose ``remaining`` field is the slack left for
+    servers that coalesce beyond the declared intervals.
     """
+    if budget is None:
+        budget = CoalesceBudget(extra_bytes)
     by_url = {}
     for pos, (url, s, e) in enumerate(items):
         by_url.setdefault(url, []).append((pos, s, e))
@@ -289,14 +338,11 @@ def plan_range_requests(items, max_ranges, max_request_bytes, extra_bytes):
     requests = []
     segs_by_url = {}
     union_bytes = 0
-    extra_remaining = extra_bytes
     for url, members in by_url.items():
         union = _union_intervals([(s, e) for _, s, e in members])
         union_bytes += sum(e - s for s, e in union)
         segs = []
-        extra_remaining = _plan_url(
-            union, max_ranges, max_request_bytes, extra_remaining, requests, segs, url
-        )
+        _plan_url(union, max_ranges, max_request_bytes, budget, requests, segs, url)
         segs_by_url[url] = segs
 
     declared_bytes = sum(e - s for _, ivs in requests for s, e in ivs)
@@ -321,4 +367,12 @@ def plan_range_requests(items, max_ranges, max_request_bytes, extra_bytes):
                 i += 1
             input_map[pos] = tuple(reqs)
 
-    return RangePlan(requests, input_map, union_bytes, declared_bytes)
+    planner_spend = declared_bytes - union_bytes
+    return RangePlan(
+        requests,
+        input_map,
+        union_bytes,
+        declared_bytes,
+        planner_spend,
+        budget,
+    )

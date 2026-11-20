@@ -20,6 +20,7 @@ from fsspec.asyn import (
 from fsspec.callbacks import DEFAULT_CALLBACK
 from fsspec.exceptions import FSTimeoutError
 from fsspec.multirange import (
+    CoalesceBudget,
     RangeResponseError,
     plan_range_requests,
     validate_cat_ranges_args,
@@ -259,6 +260,7 @@ class HTTPFileSystem(AsyncFileSystem):
         batch_size=None,
         on_error="return",
         range_policy=None,
+        _range_budget=None,
         **kwargs,
     ):
         """Get the contents of byte ranges from one or more files
@@ -291,6 +293,13 @@ class HTTPFileSystem(AsyncFileSystem):
             the whole call, and responses are validated against RFC 9110
             (single-range 206 and multipart/byteranges 206) and against
             these budgets. See ``fsspec.multirange`` for the exact semantics.
+        _range_budget: CoalesceBudget, optional
+            Shared call-level budget, used by the reference layer so that
+            ranges planned against several independent backends draw from a
+            single ``extra_bytes`` allowance. Private callers only; a
+            standalone call creates its own budget. The budget's remaining
+            bytes cover both planner gap-bridging and server-coalesced
+            responses of this call.
 
         Returns
         -------
@@ -313,6 +322,8 @@ class HTTPFileSystem(AsyncFileSystem):
             raise ValueError(
                 "on_error must be 'raise' or 'return' when range_policy is used"
             )
+        if _range_budget is not None and not isinstance(_range_budget, CoalesceBudget):
+            raise TypeError("_range_budget must be a CoalesceBudget instance")
         max_ranges, max_request_bytes, extra_bytes = validate_range_policy(range_policy)
         items = validate_cat_ranges_args(paths, starts, ends)
         out = [b""] * len(items)
@@ -325,12 +336,15 @@ class HTTPFileSystem(AsyncFileSystem):
             max_ranges,
             max_request_bytes,
             extra_bytes,
+            budget=_range_budget,
         )
         session = await self.set_session()
         base_kw = self.kwargs.copy()
         base_kw.update(kwargs)
-        # slack left for servers that coalesce ranges beyond what we declared
-        budget = _CoalesceBudget(plan.union_bytes + extra_bytes - plan.declared_bytes)
+        # the plan's budget is the single call-level allowance: it has
+        # already paid for the planner's gap bridging and now covers any
+        # extra source bytes a server coalesces into its responses
+        budget = plan.budget
         totals = {}  # url -> total length reported by responses (consistency)
 
         thunks = [
@@ -745,19 +759,6 @@ _CONTENT_RANGE_STR = re.compile(r"bytes (\d+)-(\d+)/(\d+|\*)")
 _CONTENT_RANGE_BYTES = re.compile(rb"bytes (\d+)-(\d+)/(\d+|\*)")
 
 
-class _CoalesceBudget:
-    """Call-level slack (in bytes) for server-coalesced ranges.
-
-    Shared by all requests of one ``cat_ranges`` call; check-and-take
-    happens without intervening awaits, so it is atomic under asyncio.
-    """
-
-    __slots__ = ("remaining",)
-
-    def __init__(self, remaining):
-        self.remaining = remaining
-
-
 async def _gather_in_chunks(thunks, batch_size):
     """Run zero-arg coroutine factories with at most batch_size in flight.
 
@@ -946,6 +947,8 @@ async def _read_single(r, intervals, declared, max_request_bytes, budget):
     length = last - first + 1
     if length > max_request_bytes:
         raise RangeResponseError("response carries more than max_request_bytes of data")
+    # verify the call budget before reading the body; the definitive
+    # charge happens once, in _check_extents after the response parses
     if length - declared > budget.remaining:
         raise RangeResponseError("coalesced response exceeds the extra_bytes budget")
     cl = r.headers.get("Content-Length")
@@ -999,7 +1002,9 @@ async def _read_multipart(stream, boundary, declared, max_request_bytes, budget)
         payload = await reader.read_exactly(last - first + 1, source=True)
         _add_extent(extents, first, last + 1, payload)
         if reader.source - declared > budget.remaining:
-            # coalescing beyond the call budget; fail before reading more
+            # coalescing beyond the call budget; fail before reading more.
+            # the definitive charge happens in _check_extents once the
+            # whole response has been parsed
             raise RangeResponseError(
                 "coalesced response exceeds the extra_bytes budget"
             )
@@ -1057,10 +1062,9 @@ def _check_extents(extents, total, intervals, url, totals, budget):
             raise RangeResponseError("response does not cover all requested ranges")
     received = sum(e - s for s, e in ext_sorted)
     declared = sum(e - s for s, e in intervals)
-    extra = received - declared
-    if extra > budget.remaining:
-        raise RangeResponseError("coalesced response exceeds the extra_bytes budget")
-    budget.remaining -= extra
+    # charge the server-coalesced source bytes against the single
+    # call-level budget; raises without mutating the budget when exceeded
+    budget.take(received - declared)
 
 
 class HTTPFile(AbstractBufferedFile):

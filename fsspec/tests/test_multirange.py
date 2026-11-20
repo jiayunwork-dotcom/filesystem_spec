@@ -3,7 +3,8 @@ import random
 import pytest
 
 from fsspec.multirange import (
-    RangePlan,
+    CoalesceBudget,
+    RangeResponseError,
     plan_range_requests,
     validate_cat_ranges_args,
     validate_range_policy,
@@ -75,7 +76,11 @@ def test_validate_args_bad(paths, starts, ends, exc):
 
 def test_plan_empty():
     plan = plan_range_requests([], 4, 100, 50)
-    assert plan == RangePlan([], [], 0, 0)
+    assert plan.requests == []
+    assert plan.input_map == []
+    assert plan.union_bytes == 0
+    assert plan.declared_bytes == 0
+    assert plan.budget.remaining == 50
 
 
 def test_plan_dense_coalescing():
@@ -216,3 +221,83 @@ def test_plan_fuzz_with_long_ranges():
             s = rng.randrange(0, 10000)
             items.append(("u", s, s + rng.randrange(1, 9000)))
         check_plan_invariants(items, rng.randint(1, 4), rng.randint(100, 3000), 100)
+
+
+# --------------------------------------------------------------------------
+# the single call-level CoalesceBudget shared across backends/batches
+# --------------------------------------------------------------------------
+
+
+def test_budget_take_and_overrun():
+    budget = CoalesceBudget(5)
+    budget.take(2)
+    assert budget.remaining == 3
+    budget.take(3)
+    assert budget.remaining == 0
+    with pytest.raises(RangeResponseError):
+        budget.take(1)
+    # a rejected charge does not mutate the budget
+    assert budget.remaining == 0
+
+
+def test_plan_records_planner_spend():
+    plan = plan_range_requests([("u", 0, 40), ("u", 60, 100)], 1, 1000, 20)
+    # the only way to satisfy max_ranges=1 is bridging the 20-byte gap
+    assert plan.planner_spend == 20
+    assert plan.declared_bytes == plan.union_bytes + 20
+    assert plan.budget.remaining == 0
+
+
+def test_shared_budget_between_two_planners():
+    # two independent backends plan sequentially against one budget:
+    # the second planner must see what the first one spent
+    budget = CoalesceBudget(30)
+    plan1 = plan_range_requests(
+        [("http://a/x", 0, 40), ("http://a/x", 60, 100)],
+        1,
+        1000,
+        30,
+        budget=budget,
+    )
+    assert plan1.planner_spend == 20
+    assert plan1.budget is budget
+    assert budget.remaining == 10
+
+    # the second backend's 15-byte gap cannot be bridged with 10 left,
+    # so its ranges stay split instead of overspending
+    plan2 = plan_range_requests(
+        [("https://b/y", 0, 10), ("https://b/y", 25, 35)],
+        1,
+        1000,
+        30,
+        budget=budget,
+    )
+    assert plan2.planner_spend == 0
+    assert len(plan2.requests) == 2
+    assert budget.remaining == 10
+
+
+def test_shared_budget_zero_carries_over():
+    budget = CoalesceBudget(0)
+    plan = plan_range_requests(
+        [("u", 0, 10), ("u", 100, 110)], 1, 1000, 0, budget=budget
+    )
+    assert plan.planner_spend == 0
+    assert len(plan.requests) == 2
+    assert budget.remaining == 0
+    # no slack left for a server-coalesced response either
+    with pytest.raises(RangeResponseError):
+        budget.take(1)
+
+
+def test_plan_creates_own_budget_by_default():
+    plan = plan_range_requests([("u", 0, 10)], 1, 1000, 7)
+    assert isinstance(plan.budget, CoalesceBudget)
+    assert plan.budget.remaining == 7
+
+
+def test_plan_budget_field_present_in_empty_plan():
+    plan = plan_range_requests([], 4, 100, 50)
+    assert plan.planner_spend == 0
+    assert isinstance(plan.budget, CoalesceBudget)
+    assert plan.budget.remaining == 50
